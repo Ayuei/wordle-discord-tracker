@@ -10,4 +10,4 @@ chrono = "0.4" # For precise time tracking
 dotenv = "0.15" # For loading environment variables (like your bot token)
 log = "*"
 env_logger = "*"
-chrono_tz = "*"
+chrono-tz = "*"
