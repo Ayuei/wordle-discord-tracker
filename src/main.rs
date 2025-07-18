@@ -18,7 +18,7 @@ const EMBED_TITLE: &str = "🧩 Wordle Solved!";
 const EMBED_FOOTER: &str = "Time tracked by Matt's third brain.";
 const EMBED_COLOR: (u8, u8, u8) = (87, 242, 135); // A nice green color
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Australia::Sydney;
 
 // Struct to store game state and metadata
@@ -44,7 +44,7 @@ impl GameState {
     fn is_current(&self) -> bool {
         let now_sydney = Utc::now().with_timezone(&Sydney);
         let created_sydney = self.created_at.with_timezone(&Sydney);
-        created_sydney.date() == now_sydney.date()
+        created_sydney.date_naive() == now_sydney.date_naive()
     }
 }
 
@@ -344,7 +344,7 @@ impl EventHandler for Handler {
             info!("Processing game start/resume from message edit");
             // Handle game start/resume
             for username in &usernames {
-                let entry = puzzle_map.entry((event.id, username.clone()));
+                let mut entry = puzzle_map.entry((event.id, username.clone()));
                 match entry {
                     std::collections::hash_map::Entry::Occupied(ref mut entry) => {
                         // Check if game is from a previous day
@@ -394,7 +394,7 @@ impl EventHandler for Handler {
                         let embed_msg = Self::create_completion_embed(user_name, total_time, true);
                         if let Ok(mut message) = event.channel_id.message(&ctx.http, msg_id).await {
                             if let Err(why) = message
-                                .edit(&ctx.http, |m: &mut EditMessage| m.embed(embed_msg))
+                                .edit(&ctx.http, EditMessage::new().embed(embed_msg))
                                 .await
                             {
                                 error!("Error updating completion message: {:?}", why);
@@ -406,7 +406,7 @@ impl EventHandler for Handler {
                         let embed_msg = Self::create_completion_embed(user_name, total_time, false);
                         if let Ok(sent_msg) = event
                             .channel_id
-                            .send_message(&ctx.http, |m: &mut CreateMessage| m.embed(embed_msg))
+                            .send_message(&ctx.http, CreateMessage::new().embed(embed_msg))
                             .await
                         {
                             game_state.completion_msg_id = Some(sent_msg.id);
