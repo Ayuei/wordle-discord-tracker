@@ -1,0 +1,13 @@
+[package]
+name = "wordle_timer_bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serenity = "0.12.4"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4" # For precise time tracking
+dotenv = "0.15" # For loading environment variables (like your bot token)
+log = "*"
+env_logger = "*"
+chrono_tz = "*"
