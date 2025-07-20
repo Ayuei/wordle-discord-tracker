@@ -83,12 +83,22 @@ fn parse_usernames(content: &str) -> Vec<String> {
     );
 
     // If there's " and " in the string, it's a multi-user case
-    let usernames = if before.contains(" and ") {
+    let mut usernames = if before.contains(" and ") {
         before.split(" and ").map(|s| s.trim().to_owned()).collect()
     } else {
         // Single user case
         vec![before.to_owned()]
     };
+
+    // Check for edge cases like "2 others", "3 others", etc.
+    if let Some(last_username) = usernames.last() {
+        if last_username.chars().next().unwrap_or(' ').is_numeric()
+            && last_username.ends_with(" others")
+        {
+            // Edge case with pattern like "2 others", "3 others", etc.
+            usernames.clear();
+        }
+    }
 
     info!("Found {} usernames: {:?}", usernames.len(), usernames);
     usernames
