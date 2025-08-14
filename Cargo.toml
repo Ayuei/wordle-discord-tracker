@@ -11,3 +11,7 @@ dotenv = "0.15" # For loading environment variables (like your bot token)
 log = "*"
 env_logger = "*"
 chrono-tz = "*"
+opencv = "0.95.1"
+ndarray = "*"
+anyhow = "*"
+reqwest = "*"

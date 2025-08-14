@@ -9,11 +9,12 @@ use serenity::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
+use wordle_timer_bot::{
+    FINISHED_TRIGGERS, PLAYING_TRIGGERS, Player, format_duration, parse_usernames,
+};
 
 // Constants
 const WORDLE_APP_ID: u64 = 1211781489931452447;
-const PLAYING_TRIGGERS: [&str; 2] = ["is playing", "are playing"];
-const FINISHED_TRIGGERS: [&str; 2] = ["was playing", "were playing"];
 const EMBED_TITLE: &str = "🧩 Wordle Solved!";
 const EMBED_FOOTER: &str = "Time tracked by Matt's third brain.";
 const EMBED_COLOR: (u8, u8, u8) = (87, 242, 135); // A nice green color
@@ -27,6 +28,7 @@ struct GameState {
     total_active_time: std::time::Duration, // Total time spent actively solving
     completion_msg_id: Option<serenity::model::id::MessageId>, // ID of the completion message if one exists
     created_at: DateTime<Utc>, // When this game was first started (stored in UTC)
+    completed: bool,
 }
 
 impl GameState {
@@ -37,6 +39,7 @@ impl GameState {
             total_active_time: std::time::Duration::ZERO,
             completion_msg_id: None,
             created_at: Utc::now(),
+            completed: false,
         }
     }
 
@@ -55,98 +58,8 @@ impl TypeMapKey for WordlePuzzles {
     type Value = tokio::sync::Mutex<HashMap<(serenity::model::id::MessageId, String), GameState>>;
 }
 
-/// Parse usernames from a message content string.
-/// Handles both single user ("User was playing") and multi-user ("User1 and User2 were playing") cases.
-fn parse_usernames(content: &str) -> Vec<String> {
-    let content = content.to_lowercase();
-
-    // Try each trigger to find which one matches
-    let (before, is_plural) = PLAYING_TRIGGERS
-        .iter()
-        .find_map(|&trigger| {
-            content
-                .split_once(trigger)
-                .map(|(s, _)| (s.trim(), trigger == "are playing"))
-        })
-        .or_else(|| {
-            FINISHED_TRIGGERS.iter().find_map(|&trigger| {
-                content
-                    .split_once(trigger)
-                    .map(|(s, _)| (s.trim(), trigger == "were playing"))
-            })
-        })
-        .unwrap_or(("", false));
-
-    info!(
-        "Parsing usernames from: '{}' (plural: {})",
-        before, is_plural
-    );
-
-    // If there's " and " in the string, it's a multi-user case
-    let mut usernames = if before.contains(" and ") {
-        before.split(" and ").map(|s| s.trim().to_owned()).collect()
-    } else {
-        // Single user case
-        vec![before.to_owned()]
-    };
-
-    // Check for edge cases like "2 others", "3 others", etc.
-    if let Some(last_username) = usernames.last() {
-        if last_username.chars().next().unwrap_or(' ').is_numeric()
-            && last_username.ends_with(" others")
-        {
-            // Edge case with pattern like "2 others", "3 others", etc.
-            usernames.clear();
-        }
-    }
-
-    info!("Found {} usernames: {:?}", usernames.len(), usernames);
-    usernames
-}
-
 struct Handler {
     daily_puzzles_channel_name: String,
-}
-
-/// Format a duration into a human-readable string
-fn format_duration(duration: std::time::Duration) -> String {
-    let total_seconds = duration.as_secs();
-    let hours = total_seconds / 3600;
-    let remaining_seconds_after_hours = total_seconds % 3600;
-    let minutes = remaining_seconds_after_hours / 60;
-    let seconds = remaining_seconds_after_hours % 60;
-    let milliseconds = duration.subsec_millis();
-
-    let mut time_parts = Vec::new();
-
-    if hours > 0 {
-        time_parts.push(format!(
-            "{} hour{}",
-            hours,
-            if hours != 1 { "s" } else { "" }
-        ));
-    }
-    if minutes > 0 {
-        time_parts.push(format!(
-            "{} minute{}",
-            minutes,
-            if minutes != 1 { "s" } else { "" }
-        ));
-    }
-    // Always include seconds and milliseconds
-    time_parts.push(format!(
-        "{}.{:03} second{}",
-        seconds,
-        milliseconds,
-        if seconds != 1 { "s" } else { "" }
-    ));
-
-    if time_parts.len() == 1 {
-        time_parts[0].clone()
-    } else {
-        let last_part = time_parts.pop().unwrap(); // Safe to unwrap as we always have milliseconds
-        format!("{} and {}", time_parts.join(", "), last_part)
-    }
 }
 
 impl Handler {
@@ -342,6 +255,39 @@ impl EventHandler for Handler {
 
         // Parse usernames from content
         let usernames = parse_usernames(&content);
+
+        if usernames.is_empty() {
+            let channel = match event.channel_id.to_channel(&ctx.http).await {
+                Ok(channel) => channel,
+                Err(why) => {
+                    error!("Error getting channel: {:?}", why);
+                    return;
+                }
+            };
+
+            let guild = match channel.guild() {
+                Some(guild) => guild,
+                None => {
+                    info!("Channel is not in a guild");
+                    return;
+                }
+            };
+
+            let members = match guild.members(ctx.cache) {
+                Ok(members) => members,
+                Err(why) => {
+                    error!("Error getting guild members: {:?}", why);
+                    return;
+                }
+            };
+
+            let players: Vec<Player> = Vec::new();
+
+            for member in members {
+                if let Some(image_url) = member.user.static_avatar_url() {}
+            }
+        }
+
         info!(
             "Message update - Found {} users: {:?}",
             usernames.len(),
