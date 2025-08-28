@@ -1,20 +1,18 @@
-use log::{debug, error, info};
-use serenity::all::{
-    Colour, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage, MessageUpdateEvent,
-};
+use log::{debug, error, info, warn};
+use serenity::all::{Colour, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage, Presence};
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::id::UserId;
 use serenity::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
-use wordle_timer_bot::{
-    FINISHED_TRIGGERS, PLAYING_TRIGGERS, Player, format_duration, parse_usernames,
-};
+use wordle_timer_bot::{Player, download_image, format_duration, verify_player_completion};
 
 // Constants
 const WORDLE_APP_ID: u64 = 1211781489931452447;
+const WORDLE_ACTIVITY_NAME: &str = "Wordle";
 const EMBED_TITLE: &str = "🧩 Wordle Solved!";
 const EMBED_FOOTER: &str = "Time tracked by Matt's third brain.";
 const EMBED_COLOR: (u8, u8, u8) = (87, 242, 135); // A nice green color
@@ -24,22 +22,26 @@ use chrono_tz::Australia::Sydney;
 
 // Struct to store game state and metadata
 struct GameState {
-    last_start_time: Instant,               // When the current attempt started
-    total_active_time: std::time::Duration, // Total time spent actively solving
+    user_id: UserId,                                           // Discord user ID
+    last_start_time: Instant,                                  // When the current attempt started
+    total_active_time: std::time::Duration,                    // Total time spent actively solving
     completion_msg_id: Option<serenity::model::id::MessageId>, // ID of the completion message if one exists
     created_at: DateTime<Utc>, // When this game was first started (stored in UTC)
-    completed: bool,
+    completed: bool,           // Whether the game has been completed
+    channel_id: Option<serenity::model::id::ChannelId>, // Channel where completion was detected
 }
 
 impl GameState {
     /// Creates a new GameState instance
-    fn new() -> Self {
+    fn new(user_id: UserId) -> Self {
         Self {
+            user_id,
             last_start_time: Instant::now(),
             total_active_time: std::time::Duration::ZERO,
             completion_msg_id: None,
             created_at: Utc::now(),
             completed: false,
+            channel_id: None,
         }
     }
 
@@ -49,20 +51,80 @@ impl GameState {
         let created_sydney = self.created_at.with_timezone(&Sydney);
         created_sydney.date_naive() == now_sydney.date_naive()
     }
+
+    /// Updates the total active time and resets the start time
+    fn update_active_time(&mut self) {
+        self.total_active_time += Instant::now().duration_since(self.last_start_time);
+        self.last_start_time = Instant::now();
+    }
 }
 
 // Struct to store active games
 struct WordlePuzzles;
 
 impl TypeMapKey for WordlePuzzles {
-    type Value = tokio::sync::Mutex<HashMap<(serenity::model::id::MessageId, String), GameState>>;
+    type Value = tokio::sync::Mutex<HashMap<UserId, GameState>>;
 }
 
 struct Handler {
     daily_puzzles_channel_name: String,
 }
 
+/// Custom error type for member-related operations
+#[derive(Debug)]
+pub enum MemberError {
+    NotFound(String),
+    ApiError(String),
+    RetryExhausted(String),
+}
+
+impl std::fmt::Display for MemberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemberError::NotFound(msg) => write!(f, "Member not found: {}", msg),
+            MemberError::ApiError(msg) => write!(f, "API error: {}", msg),
+            MemberError::RetryExhausted(msg) => write!(f, "Retry attempts exhausted: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for MemberError {}
+
 impl Handler {
+    /// Attempts to get a guild member with retry logic
+    async fn get_member_with_retry(
+        ctx: &Context,
+        guild_id: Option<serenity::model::id::GuildId>,
+        user_id: serenity::model::id::UserId,
+    ) -> Result<serenity::model::guild::Member, Box<dyn std::error::Error + Send + Sync>> {
+        const MAX_RETRIES: u32 = 3;
+        let guild_id = guild_id.ok_or(MemberError::NotFound("No guild ID provided".to_string()))?;
+
+        let mut last_error = None;
+        for retry in 0..MAX_RETRIES {
+            match guild_id.member(&ctx.http, user_id).await {
+                Ok(member) => return Ok(member),
+                Err(e) => {
+                    warn!(
+                        "Failed to get member info (attempt {}/{}): {}",
+                        retry + 1,
+                        MAX_RETRIES,
+                        e
+                    );
+                    last_error = Some(e);
+                    if retry < MAX_RETRIES - 1 {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1 << retry)).await;
+                    }
+                }
+            }
+        }
+
+        Err(Box::new(MemberError::RetryExhausted(format!(
+            "Failed after {} attempts: {:?}",
+            MAX_RETRIES, last_error
+        ))))
+    }
+
     /// Creates an embed for a Wordle completion message
     fn create_completion_embed(
         user_name: &str,
@@ -92,6 +154,83 @@ impl Handler {
                 EMBED_COLOR.2,
             ))
             .footer(CreateEmbedFooter::new(EMBED_FOOTER))
+    }
+
+    /// Send a new completion message
+    async fn send_completion_message(
+        ctx: &Context,
+        channel_id: serenity::model::id::ChannelId,
+        username: &str,
+        total_time: std::time::Duration,
+        game_state: &mut GameState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let embed_msg = Self::create_completion_embed(username, total_time, false);
+        let sent_msg = channel_id
+            .send_message(&ctx.http, CreateMessage::new().embed(embed_msg))
+            .await?;
+
+        game_state.completion_msg_id = Some(sent_msg.id);
+        info!(
+            "Sent completion message for user {} - Time: {:?}",
+            username, total_time
+        );
+        Ok(())
+    }
+
+    /// Update an existing completion message
+    async fn update_completion_message(
+        ctx: &Context,
+        channel_id: serenity::model::id::ChannelId,
+        message_id: serenity::model::id::MessageId,
+        username: &str,
+        total_time: std::time::Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let embed_msg = Self::create_completion_embed(username, total_time, true);
+        let mut message = channel_id.message(&ctx.http, message_id).await?;
+        message
+            .edit(&ctx.http, EditMessage::new().embed(embed_msg))
+            .await?;
+
+        info!(
+            "Updated completion message for user {} - Time: {:?}",
+            username, total_time
+        );
+        Ok(())
+    }
+
+    /// Verify completion with retry logic
+    async fn verify_completion_with_retry(
+        player: &mut Player,
+        haystack_fp: &str,
+        max_retries: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut retries = 0;
+        let mut last_error = None;
+
+        while retries < max_retries {
+            match verify_player_completion(player, haystack_fp.to_string()).await {
+                Ok(completed) => return Ok(completed),
+                Err(e) => {
+                    warn!(
+                        "Retry {} failed for user {}: {}",
+                        retries + 1,
+                        player.username,
+                        e
+                    );
+                    last_error = Some(e);
+                    retries += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
+                }
+            }
+        }
+
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Failed to verify completion after {} retries: {:?}",
+                max_retries, last_error
+            ),
+        )))
     }
 
     /// Validates if a message is from the Wordle app and in the correct channel
@@ -127,253 +266,183 @@ impl EventHandler for Handler {
         info!("{} is connected!", ready.user.name);
     }
 
-    // Fired when a new message is created
-    async fn message(&self, ctx: Context, msg: Message) {
-        // Validate message is from Wordle app and in correct channel
-        if let Err(why) = self
-            .validate_message(&ctx, msg.channel_id, msg.author.id)
-            .await
-        {
-            info!("Message validation failed: {}", why);
-            return;
-        }
+    // Fired when a user's presence is updated
+    async fn presence_update(&self, ctx: Context, presence: Presence) {
+        let user_id = presence.user.id;
 
-        let content = msg.content.to_lowercase();
-        debug!("{}", content);
+        // Find Wordle activity if it exists
+        let wordle_activity = presence.activities.iter().find(|activity| {
+            activity.name == WORDLE_ACTIVITY_NAME
+                && activity
+                    .application_id
+                    .map_or(false, |id| id.get() == WORDLE_APP_ID)
+        });
 
-        let Some(_guild_id) = msg.guild_id else {
-            info!("Missing guild id");
-            return;
-        };
-
-        // Check if this is a Wordle game start or resume
-        if PLAYING_TRIGGERS
-            .iter()
-            .any(|&trigger| content.contains(trigger))
-        {
-            let data_read = ctx.data.read().await;
-            let puzzle_lock = data_read
-                .get::<WordlePuzzles>()
-                .expect("Expected WordlePuzzles in TypeMap")
-                .lock();
-
-            // Parse all usernames from the message
-            let usernames = parse_usernames(&content);
-
-            // Create a timer entry for each user
-            let mut puzzle_map = puzzle_lock.await;
-            for username in &usernames {
-                let mut entry = puzzle_map.entry((msg.id, username.clone()));
-                match entry {
-                    std::collections::hash_map::Entry::Occupied(ref mut entry) => {
-                        // Check if game is from a previous day
-                        let is_current = entry.get().is_current();
-                        if !is_current {
-                            info!("Resetting game from previous day");
-                            // Reset game state for new day
-                            entry.insert(GameState::new());
-                            info!("Previous day's game replaced for user: {}", username);
-                        } else {
-                            // This is a resume - update total active time and start new attempt
-                            let game_state = entry.get_mut();
-                            game_state.total_active_time +=
-                                Instant::now().duration_since(game_state.last_start_time);
-                            game_state.last_start_time = Instant::now();
-                            info!("Resumed game for user: {}", username);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(vacant) => {
-                        // This is a new game
-                        vacant.insert(GameState::new());
-                        info!("Started new game for user: {}", username);
-                    }
-                }
-            }
-            drop(puzzle_map);
-
-            info!(
-                "Tracking Wordle for message ID: {} with {} users",
-                msg.id,
-                usernames.len()
-            );
-        }
-    }
-
-    // Fired when an existing message is updated (e.g., edited)
-    async fn message_update(
-        &self,
-        ctx: Context,
-        _old_if_available: Option<Message>,
-        _new: Option<Message>,
-        event: MessageUpdateEvent,
-    ) {
-        debug!("Message update fired");
-
-        // Get author from event
-        let author = match event.author {
-            Some(v) => v,
-            None => {
-                info!("Unable to find author of the message update");
-                return;
-            }
-        };
-
-        // Validate message is from Wordle app and in correct channel
-        if let Err(why) = self
-            .validate_message(&ctx, event.channel_id, author.id)
-            .await
-        {
-            info!("Message validation failed: {}", why);
-            return;
-        }
-
-        // Get content from event
-        let Some(content) = event.content else {
-            info!("Unable to find content of the message update");
-            return;
-        };
-
-        let Some(_guild_id) = event.guild_id else {
-            info!("Missing guild id");
-            return;
-        };
-
-        // Check if this is a game start/resume or completion
-        let is_playing = PLAYING_TRIGGERS
-            .iter()
-            .any(|&trigger| content.contains(trigger));
-        let is_finished = FINISHED_TRIGGERS
-            .iter()
-            .any(|&trigger| content.contains(trigger));
-
-        // Get the shared data
         let data_read = ctx.data.read().await;
         let puzzle_lock = data_read
             .get::<WordlePuzzles>()
             .expect("Expected WordlePuzzles in TypeMap")
             .lock();
-
-        // Parse usernames from content
-        let usernames = parse_usernames(&content);
-
-        if usernames.is_empty() {
-            let channel = match event.channel_id.to_channel(&ctx.http).await {
-                Ok(channel) => channel,
-                Err(why) => {
-                    error!("Error getting channel: {:?}", why);
-                    return;
-                }
-            };
-
-            let guild = match channel.guild() {
-                Some(guild) => guild,
-                None => {
-                    info!("Channel is not in a guild");
-                    return;
-                }
-            };
-
-            let members = match guild.members(ctx.cache) {
-                Ok(members) => members,
-                Err(why) => {
-                    error!("Error getting guild members: {:?}", why);
-                    return;
-                }
-            };
-
-            let players: Vec<Player> = Vec::new();
-
-            for member in members {
-                if let Some(image_url) = member.user.static_avatar_url() {}
-            }
-        }
-
-        info!(
-            "Message update - Found {} users: {:?}",
-            usernames.len(),
-            usernames
-        );
-
         let mut puzzle_map = puzzle_lock.await;
 
-        if is_playing {
-            info!("Processing game start/resume from message edit");
-            // Handle game start/resume
-            for username in &usernames {
-                let mut entry = puzzle_map.entry((event.id, username.clone()));
-                match entry {
-                    std::collections::hash_map::Entry::Occupied(ref mut entry) => {
-                        // Check if game is from a previous day
-                        let is_current = entry.get().is_current();
-                        if !is_current {
-                            info!("Resetting game from previous day for {}", username);
-                            // Reset game state for new day
-                            entry.insert(GameState::new());
-                        } else {
-                            // This is a resume - update total active time and start new attempt
-                            let game_state = entry.get_mut();
-                            game_state.total_active_time +=
-                                Instant::now().duration_since(game_state.last_start_time);
-                            game_state.last_start_time = Instant::now();
+        match wordle_activity {
+            Some(activity) => {
+                // User is playing Wordle
+                debug!(
+                    "User {} is playing Wordle (state: {:?})",
+                    user_id, activity.state
+                );
+
+                match puzzle_map.entry(user_id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let game_state = entry.get_mut();
+                        if !game_state.is_current() {
+                            // Reset for new day
+                            *game_state = GameState::new(user_id);
                             info!(
-                                "Resumed game for {} (total time: {:?})",
-                                username, game_state.total_active_time
+                                "Reset game state for new day - User: {} (previous time: {:?})",
+                                user_id, game_state.total_active_time
+                            );
+                        } else {
+                            debug!(
+                                "Continuing existing game for user {} (current time: {:?})",
+                                user_id, game_state.total_active_time
                             );
                         }
                     }
-                    std::collections::hash_map::Entry::Vacant(vacant) => {
-                        // This is a new game
-                        vacant.insert(GameState::new());
-                        info!("Started new game for {}", username);
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        // Start new game tracking
+                        entry.insert(GameState::new(user_id));
+                        info!("Started tracking new Wordle game for user: {}", user_id);
                     }
                 }
             }
-        } else if is_finished {
-            info!("Processing game completion from message edit");
-            // Handle game completion
-            for user_name in &usernames {
-                if let Some(game_state) = puzzle_map.get_mut(&(event.id, user_name.clone())) {
-                    // Add the time from the current attempt
-                    let current_attempt_time =
-                        Instant::now().duration_since(game_state.last_start_time);
-                    let total_time = game_state.total_active_time + current_attempt_time;
+            None => {
+                // User is not playing Wordle
+                if let Some(game_state) = puzzle_map.get_mut(&user_id) {
+                    if !game_state.completed {
+                        game_state.update_active_time();
+                        info!(
+                            "User {} stopped playing - Total active time: {:?}",
+                            user_id, game_state.total_active_time
+                        );
+                    } else {
+                        debug!(
+                            "Ignoring presence update for completed game - User: {}",
+                            user_id
+                        );
+                    }
+                } else {
+                    debug!("No active game found for user: {}", user_id);
+                }
+            }
+        }
+    }
 
-                    info!(
-                        "User {} completed game - Current attempt: {:?}, Total time: {:?}",
-                        user_name, current_attempt_time, total_time
+    // Fired when a new message is created
+    async fn message(&self, ctx: Context, msg: Message) {
+        // Only process messages from Wordle app in the correct channel
+        if let Err(why) = self
+            .validate_message(&ctx, msg.channel_id, msg.author.id)
+            .await
+        {
+            debug!("Message validation failed: {}", why);
+            return;
+        }
+
+        // Check for completion message
+        if let Some(attachment) = msg.attachments.last() {
+            let data_read = ctx.data.read().await;
+            let puzzle_lock = data_read
+                .get::<WordlePuzzles>()
+                .expect("Expected WordlePuzzles in TypeMap")
+                .lock();
+            let mut puzzle_map = puzzle_lock.await;
+
+            // Download the completion image
+            let haystack_fp = match download_image(&attachment.url).await {
+                Ok(fp) => fp,
+                Err(e) => {
+                    error!("Failed to download image: {}", e);
+                    return;
+                }
+            };
+
+            // Check each active player for completion
+            for (user_id, game_state) in puzzle_map.iter_mut() {
+                // Skip if:
+                // 1. Game is already completed
+                // 2. Game is not from today
+                // 3. User is not currently playing
+                if game_state.completed || !game_state.is_current() {
+                    debug!(
+                        "Skipping user {} - completed: {}, current: {}",
+                        user_id,
+                        game_state.completed,
+                        game_state.is_current()
                     );
+                    continue;
+                }
 
-                    // Send or update completion message
-                    if let Some(msg_id) = game_state.completion_msg_id {
-                        info!("Updating existing completion message");
-                        // Update existing completion message
-                        let embed_msg = Self::create_completion_embed(user_name, total_time, true);
-                        if let Ok(mut message) = event.channel_id.message(&ctx.http, msg_id).await {
-                            if let Err(why) = message
-                                .edit(&ctx.http, EditMessage::new().embed(embed_msg))
-                                .await
+                // Get member information with retry
+                let member = match Self::get_member_with_retry(&ctx, msg.guild_id, *user_id).await {
+                    Ok(member) => member,
+                    Err(e) => {
+                        warn!("Could not find member info for user {}: {}", user_id, e);
+                        continue;
+                    }
+                };
+
+                // Create player object for verification
+                let mut player = Player::new(
+                    user_id.get() as usize,
+                    member.display_name().to_string(),
+                    member.user.default_avatar_url(),
+                );
+
+                // Verify if this player has completed (with retry)
+                match Self::verify_completion_with_retry(&mut player, &haystack_fp, 5).await {
+                    Ok(true) => {
+                        info!("Detected completion for user {}", user_id);
+                        game_state.completed = true;
+                        game_state.channel_id = Some(msg.channel_id);
+                        game_state.update_active_time();
+
+                        // Send or update completion message
+                        if let Some(msg_id) = game_state.completion_msg_id {
+                            // Update existing message
+                            if let Err(e) = Self::update_completion_message(
+                                &ctx,
+                                msg.channel_id,
+                                msg_id,
+                                &player.username,
+                                game_state.total_active_time,
+                            )
+                            .await
                             {
-                                error!("Error updating completion message: {:?}", why);
+                                error!("Failed to update completion message: {}", e);
+                            }
+                        } else {
+                            // Send new completion message
+                            if let Err(e) = Self::send_completion_message(
+                                &ctx,
+                                msg.channel_id,
+                                &player.username,
+                                game_state.total_active_time,
+                                game_state,
+                            )
+                            .await
+                            {
+                                error!("Failed to send completion message: {}", e);
                             }
                         }
-                    } else {
-                        info!("Sending new completion message");
-                        // Send new completion message
-                        let embed_msg = Self::create_completion_embed(user_name, total_time, false);
-                        if let Ok(sent_msg) = event
-                            .channel_id
-                            .send_message(&ctx.http, CreateMessage::new().embed(embed_msg))
-                            .await
-                        {
-                            game_state.completion_msg_id = Some(sent_msg.id);
-                            info!("Created new completion message with ID: {:?}", sent_msg.id);
-                        }
                     }
-
-                    // Update the game state with final time
-                    game_state.total_active_time = total_time;
-                } else {
-                    info!("No game state found for user {}", user_name);
+                    Ok(false) => {
+                        debug!("User {} has not completed yet", user_id);
+                    }
+                    Err(e) => {
+                        error!("Failed to verify completion for user {}: {}", user_id, e);
+                    }
                 }
             }
         }
@@ -394,7 +463,10 @@ async fn main() {
     // Create a new instance of the Discord client
     let mut client = Client::builder(
         &token,
-        GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT,
+        GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILD_PRESENCES
+            | GatewayIntents::GUILD_MEMBERS,
     )
     .event_handler(Handler {
         daily_puzzles_channel_name,

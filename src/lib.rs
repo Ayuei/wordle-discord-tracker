@@ -5,61 +5,9 @@ use log::info;
 use opencv::imgcodecs;
 use tokio::{fs, io::AsyncWriteExt};
 
-pub const PLAYING_TRIGGERS: [&str; 2] = ["is playing", "are playing"];
-pub const FINISHED_TRIGGERS: [&str; 2] = ["was playing", "were playing"];
-
 const DATA_DIR: &'static str = "./data";
 
-/// Parse usernames from the server by seeing if their profile picture is in the picture.
-pub fn parse_usernames(content: &String) -> Vec<String> {
-    let content = content.to_lowercase();
-
-    // Try each trigger to find which one matches
-    let (before, is_plural) = PLAYING_TRIGGERS
-        .iter()
-        .find_map(|&trigger| {
-            content
-                .split_once(trigger)
-                .map(|(s, _)| (s.trim(), trigger == "are playing"))
-        })
-        .or_else(|| {
-            FINISHED_TRIGGERS.iter().find_map(|&trigger| {
-                content
-                    .split_once(trigger)
-                    .map(|(s, _)| (s.trim(), trigger == "were playing"))
-            })
-        })
-        .unwrap_or(("", false));
-
-    info!(
-        "Parsing usernames from: '{}' (plural: {})",
-        before, is_plural
-    );
-
-    // If there's " and " in the string, it's a multi-user case
-    let mut usernames = if before.contains(" and ") {
-        before.split(" and ").map(|s| s.trim().to_owned()).collect()
-    } else {
-        // Single user case
-        vec![before.to_owned()]
-    };
-
-    // Check for edge cases like "2 others", "3 others", etc.
-    if let Some(last_username) = usernames.last() {
-        if last_username.chars().next().unwrap_or(' ').is_numeric()
-            && last_username.ends_with(" others")
-        {
-            // Edge case with pattern like "2 others", "3 others", etc.
-            usernames.clear();
-        }
-    }
-
-    info!("Found {} usernames: {:?}", usernames.len(), usernames);
-
-    usernames
-}
-
-async fn download_image(url: &String) -> Result<String> {
+pub async fn download_image(url: &String) -> Result<String> {
     let file_path = format!("{DATA_DIR}/{}", url.split("/").last().unwrap());
     info!("Downloading image from {url}");
     // Send the HTTP request
@@ -76,37 +24,88 @@ async fn download_image(url: &String) -> Result<String> {
     Ok(file_path)
 }
 
+#[derive(Debug)]
 pub struct Player {
-    uid: usize,
-    profile_url: String,
+    pub uid: usize,
+    pub username: String,
+    pub profile_url: String,
+    pub downloaded_fp: Option<String>,
+    pub completed: bool,
 }
 
 impl Player {
-    pub fn new(uid: usize, profile_url: String) -> Player {
-        Player { uid, profile_url }
-    }
-}
-
-pub async fn find_players_in_image(
-    players: Vec<Player>,
-    haystack_url: String,
-) -> Result<Vec<Player>> {
-    let haystack_fp = download_image(&haystack_url).await?;
-    let haystack = imgcodecs::imread(&haystack_fp, imgcodecs::IMREAD_COLOR_RGB)?;
-    let mut found_players = Vec::new();
-
-    for player in players {
-        let image_path = download_image(&player.profile_url).await?;
-        let needle = imgcodecs::imread(&image_path, imgcodecs::IMREAD_COLOR_RGB)?;
-        let found =
-            detection::detect_needle_in_haystack(&needle, &haystack, 1, 0.6, 1.4, 100, 0.95)?;
-
-        if found.len() == 1 {
-            found_players.push(player);
+    pub fn new(uid: usize, username: String, profile_url: String) -> Player {
+        Player {
+            uid,
+            username,
+            profile_url,
+            downloaded_fp: None,
+            completed: false,
         }
     }
 
-    Ok(found_players)
+    pub async fn download_profile_picture(&mut self) -> Result<String> {
+        match &self.downloaded_fp {
+            Some(v) => Ok(v.clone()),
+            None => {
+                let fp = download_image(&self.profile_url).await?;
+                self.downloaded_fp = Some(fp.clone());
+                Ok(fp)
+            }
+        }
+    }
+}
+
+/// Verify if a specific player has completed their Wordle puzzle
+///
+/// # Arguments
+/// * `player` - The player to verify
+/// * `haystack_fp` - Path to the screenshot containing potential completions
+///
+/// # Returns
+/// * `Ok(bool)` - Whether the player has completed their puzzle
+pub async fn verify_player_completion(player: &mut Player, haystack_fp: String) -> Result<bool> {
+    let haystack = imgcodecs::imread(&haystack_fp, imgcodecs::IMREAD_COLOR_RGB)?;
+
+    // First check if there are any completions in the image
+    let needle = imgcodecs::imread("./data/solved.png", imgcodecs::IMREAD_COLOR_RGB)?;
+    let completions =
+        detection::detect_needle_in_haystack(&needle, &haystack, 30, 0.1, 1.0, 100, 1.0)?;
+
+    if completions.is_empty() {
+        println!("No completions found");
+        return Ok(false); // No completions found in image
+    }
+
+    println!("Found {} completions", completions.len());
+    println!("{:?}", completions);
+
+    // Now check if this player's avatar is next to a completion
+    let image_path = player.download_profile_picture().await?;
+    let needle = imgcodecs::imread(&image_path, imgcodecs::IMREAD_COLOR_RGB)?;
+
+    let found = detection::detect_needle_in_haystack(&needle, &haystack, 1, 0.1, 1.0, 100, 0.84)?;
+    println!("Found {:?} avatar", found);
+
+    if found.len() == 1 {
+        let x_coord_1 = found[0].0.0.x;
+        let x_coord_2 = found[0].0.1.x;
+
+        let center = (x_coord_1 + x_coord_2) / 2;
+
+        // Check if the center of the player's avatar intersects with a completion marker
+        let completed = completions.iter().any(|f| {
+            println!("{}, {}", f.0.0.x, f.0.1.x);
+            (f.0.0.x < center) && (f.0.1.x > center)
+        });
+
+        println!("Completed: {completed}, Center: {center}");
+
+        player.completed = completed;
+        Ok(completed)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Format a duration into a human-readable string

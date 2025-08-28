@@ -1,4 +1,4 @@
-use opencv::imgproc::{self, TM_CCOEFF_NORMED};
+use opencv::imgproc::{self, TM_CCOEFF_NORMED, TM_CCORR_NORMED};
 use opencv::prelude::*;
 
 use opencv::{
@@ -14,7 +14,7 @@ type MatchResult = (BoundingBox, f64); // (bounding box, confidence score)
 /// # Arguments
 /// * `needle` - Template image to search for
 /// * `haystack` - Image to search in
-/// * `num_players` - Number of players/matches to find
+/// * `num_matches` - Number of players/matches to find
 /// * `min_scale` - Minimum scale factor to try (e.g., 0.8)
 /// * `max_scale` - Maximum scale factor to try (e.g., 1.2)
 /// * `scale_steps` - Number of scale steps to try between min and max
@@ -22,7 +22,7 @@ type MatchResult = (BoundingBox, f64); // (bounding box, confidence score)
 pub fn detect_needle_in_haystack(
     needle: &Mat,
     haystack: &Mat,
-    num_players: usize,
+    num_matches: usize,
     min_scale: f64,
     max_scale: f64,
     scale_steps: usize,
@@ -52,16 +52,22 @@ pub fn detect_needle_in_haystack(
 
         // Perform template matching
         let mut result = Mat::default();
-        opencv::imgproc::match_template(
+        match opencv::imgproc::match_template(
             haystack,
             &scaled_needle,
             &mut result,
-            TM_CCOEFF_NORMED,
+            TM_CCORR_NORMED,
             &core::no_array(),
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                log::info!("Failed to match template: {e}");
+                continue;
+            }
+        };
 
         // Find matches above threshold
-        for _ in 0..num_players {
+        for _ in 0..num_matches {
             let mut min_val = 0.0;
             let mut max_val = 0.0;
             let mut min_loc = Point::default();
@@ -102,6 +108,11 @@ pub fn detect_needle_in_haystack(
                         0,
                     )?;
                 }
+
+                if matches.len() == num_matches {
+                    // Early exit
+                    break;
+                }
             }
         }
     }
@@ -110,7 +121,7 @@ pub fn detect_needle_in_haystack(
     matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Take top num_players matches
-    matches.truncate(num_players);
+    matches.truncate(num_matches);
 
     Ok(matches)
 }
